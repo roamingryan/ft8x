@@ -1,22 +1,22 @@
 {
   "station": {
-    "our_call": "N1VF",
-    "our_grid": "CM97"
+    "our_call": "E51RWK",
+    "our_grid": "BG08"
   },
   "rig": {
-    "kind": null,
+    "kind": "mchf",
     "port_path": null,
-    "input_device": null,
-    "output_device": null,
+    "input_device": "pulse",
+    "output_device": "pulse",
     "power_setting": null,
     "power_w": null
   },
   "tx": {
     "base_freq_hz": 1000.0,
-    "drive_level": 0.96,
+    "drive_level": 0.9,
     "playback_channels": 2,
     "output_device": null,
-    "power_w": 20.0,
+    "power_w": 5.0,
     "tx_freq_min_hz": 200.0,
     "tx_freq_max_hz": 3500.0
   },
