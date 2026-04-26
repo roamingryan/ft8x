@@ -865,7 +865,7 @@ struct IneligibleQso {
     call: String,
     started_at: Option<SystemTime>,
     ended_at: Option<SystemTime>,
-    reasons: Vec<String>,
+    reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5557,16 +5557,6 @@ fn adif_record_from_session(
 ) -> Result<AdifRecord, IneligibleQso> {
     let started_at = session.started_at.or(session.last_seen_at);
     let ended_at = session.ended_at.or(session.last_seen_at);
-    let mut reasons = Vec::new();
-    if !session.got_reply {
-        reasons.push("no directed reply from peer".to_string());
-    }
-    if !session.got_roger {
-        reasons.push("no roger/ack from peer".to_string());
-    }
-    if !session.reached_73 {
-        reasons.push("we never sent terminal 73/RR73".to_string());
-    }
     let configured_station = station_callsign.trim().to_uppercase();
     let mismatched_station_calls = session
         .observed_station_calls
@@ -5574,55 +5564,67 @@ fn adif_record_from_session(
         .filter(|call| *call != &configured_station)
         .cloned()
         .collect::<Vec<_>>();
-    if !session.observed_station_calls.is_empty()
+    let primary_reason = if started_at.is_none() {
+        Some("missing QSO start time".to_string())
+    } else if !session.observed_station_calls.is_empty()
         && !session.observed_station_calls.contains(&configured_station)
     {
-        reasons.push(format!(
+        Some(format!(
             "session logged under different station callsign(s): {}",
             mismatched_station_calls.join(", ")
-        ));
-    }
-    let band = match session.rig_band.as_deref().and_then(normalize_adif_band) {
-        Some(value) => Some(value),
-        None => {
-            reasons.push("missing rig band".to_string());
-            None
-        }
+        ))
+    } else if !session.got_reply {
+        Some("no directed reply from peer".to_string())
+    } else if session.received_report.is_none() {
+        Some("missing received report".to_string())
+    } else if session.sent_report.is_none() {
+        Some("missing sent report".to_string())
+    } else if !session.got_roger {
+        Some("no roger/ack from peer".to_string())
+    } else if !session.reached_73 {
+        Some("we never sent terminal 73/RR73".to_string())
+    } else if session
+        .rig_band
+        .as_deref()
+        .and_then(normalize_adif_band)
+        .is_none()
+    {
+        Some("missing rig band".to_string())
+    } else if session
+        .app_mode
+        .as_deref()
+        .and_then(normalize_adif_mode)
+        .is_none()
+    {
+        Some("missing or unsupported app mode".to_string())
+    } else {
+        None
     };
-    let mode_parts = match session.app_mode.as_deref().and_then(normalize_adif_mode) {
-        Some(value) => Some(value),
-        None => {
-            reasons.push("missing or unsupported app mode".to_string());
-            None
-        }
-    };
-    let rst_sent = match session.sent_report.clone() {
-        Some(value) => Some(value),
-        None => {
-            reasons.push("missing sent report".to_string());
-            None
-        }
-    };
-    let rst_rcvd = match session.received_report.clone() {
-        Some(value) => Some(value),
-        None => {
-            reasons.push("missing received report".to_string());
-            None
-        }
-    };
-    if started_at.is_none() {
-        reasons.push("missing QSO start time".to_string());
-    }
-    if !reasons.is_empty() {
+    if let Some(reason) = primary_reason {
         return Err(IneligibleQso {
             session_id: session.session_id,
             call: session.partner_call,
             started_at,
             ended_at,
-            reasons,
+            reason,
         });
     }
-    let (mode, submode) = mode_parts.expect("validated mode");
+    let band = session
+        .rig_band
+        .as_deref()
+        .and_then(normalize_adif_band)
+        .expect("validated band");
+    let mode_parts = session
+        .app_mode
+        .as_deref()
+        .and_then(normalize_adif_mode)
+        .expect("validated mode");
+    let rst_sent = session.sent_report.clone().expect("validated sent report");
+    let rst_rcvd = session
+        .received_report
+        .clone()
+        .expect("validated received report");
+    let (mode, submode) = mode_parts;
     Ok(AdifRecord {
         session_id: session.session_id,
         call: session.partner_call,
@@ -5630,12 +5632,12 @@ fn adif_record_from_session(
         time_on: format_adif_time(started_at.expect("validated start")),
         qso_date_off: ended_at.map(format_adif_date),
         time_off: ended_at.map(format_adif_time),
-        band: band.expect("validated band"),
+        band,
         freq: session.rig_frequency_hz.map(format_adif_freq_mhz),
         mode: mode.to_string(),
         submode: submode.map(str::to_string),
-        rst_sent: rst_sent.expect("validated sent report"),
-        rst_rcvd: rst_rcvd.expect("validated received report"),
+        rst_sent,
+        rst_rcvd,
         station_callsign: station_callsign.to_string(),
         my_gridsquare: my_gridsquare.to_string(),
         gridsquare: session.remote_grid,
@@ -5681,9 +5683,7 @@ fn print_adif_export_status(report: &AdifExportReport) {
     if !report.ineligible_sessions.is_empty() {
         let mut by_reason = BTreeMap::<String, usize>::new();
         for session in &report.ineligible_sessions {
-            for reason in &session.reasons {
-                *by_reason.entry(reason.clone()).or_default() += 1;
-            }
+            *by_reason.entry(session.reason.clone()).or_default() += 1;
         }
         eprintln!("Ineligible summary:");
         for (reason, count) in by_reason {
@@ -5698,10 +5698,7 @@ fn print_adif_export_status(report: &AdifExportReport) {
                 .unwrap_or_else(|| "-".to_string());
             eprintln!(
                 "  {}  #{}  {}  {}",
-                when,
-                session.session_id,
-                session.call,
-                session.reasons.join("; ")
+                when, session.session_id, session.call, session.reason
             );
         }
     }
@@ -11254,20 +11251,9 @@ mod tests {
         assert!(report.eligible_records.is_empty());
         assert_eq!(report.ineligible_sessions.len(), 1);
         assert_eq!(report.ineligible_sessions[0].session_id, 23);
-        assert!(
-            report.ineligible_sessions[0]
-                .reasons
-                .contains(&"no roger/ack from peer".to_string())
-        );
-        assert!(
-            report.ineligible_sessions[0]
-                .reasons
-                .contains(&"we never sent terminal 73/RR73".to_string())
-        );
-        assert!(
-            report.ineligible_sessions[0]
-                .reasons
-                .contains(&"missing sent report".to_string())
+        assert_eq!(
+            report.ineligible_sessions[0].reason,
+            "missing sent report".to_string()
         );
     }
 
@@ -11298,9 +11284,8 @@ mod tests {
         assert_eq!(report.ineligible_sessions.len(), 1);
         assert!(
             report.ineligible_sessions[0]
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("different station callsign(s): N1VF"))
+                .reason
+                .contains("different station callsign(s): N1VF")
         );
     }
 
