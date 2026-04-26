@@ -238,6 +238,23 @@ Meanings:
   - `send_73`
   - `send_73_once`
 
+## ADIF Export
+
+Use the built-in exporter to turn the QSO FSM JSONL log into LoTW-friendly ADIF:
+
+```bash
+cargo run --bin ft8rx -- export-adif --config config/ft8rx.json --output logs/ft8rx-lotw.adi
+```
+
+Notes:
+
+- input defaults to `logging.fsm_log_path` from the config
+- output defaults to stdout if `--output` is omitted
+- the command prints stderr status for ineligible QSOs and a count summary for eligible grids, countries, and DXCC entities
+- only conservative award-valid QSOs are exported
+- exported records use `MODE=MFSK` with `SUBMODE=FT8` or `SUBMODE=FT4`
+- country/DXCC counting uses the local `~/.local/cty` database when available
+
 ## Queue model
 
 The queue is in-memory only.

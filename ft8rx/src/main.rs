@@ -7,7 +7,7 @@ use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Local, Utc};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use config::AppConfig;
 use ft8_decoder::{
     AudioBuffer, CallModifier, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage,
@@ -31,9 +31,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as IoWrite};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -67,6 +68,8 @@ const CONFIG_DEFAULT: &str = "config/ft8rx.json";
 #[derive(Debug, Parser)]
 #[command(name = "ft8rx")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
     #[arg(long)]
     oneshot: bool,
     #[arg(long, default_value = WEB_BIND_DEFAULT)]
@@ -81,6 +84,21 @@ struct Cli {
     device: Option<String>,
     #[arg(long, default_value = "medium", value_name = "quick|medium|deepest")]
     decode_profile: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    ExportAdif(ExportAdifArgs),
+}
+
+#[derive(Debug, Args)]
+struct ExportAdifArgs {
+    #[arg(long, default_value = CONFIG_DEFAULT)]
+    config: PathBuf,
+    #[arg(long)]
+    input: Option<PathBuf>,
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -794,6 +812,66 @@ struct QsoJsonlSessionSummary {
     sent_infos: Vec<String>,
     received_infos: Vec<String>,
     exit_reason: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AdifSessionSummary {
+    session_id: u64,
+    partner_call: String,
+    started_at: Option<SystemTime>,
+    ended_at: Option<SystemTime>,
+    last_seen_at: Option<SystemTime>,
+    rig_band: Option<String>,
+    rig_frequency_hz: Option<u64>,
+    app_mode: Option<String>,
+    got_reply: bool,
+    got_roger: bool,
+    reached_73: bool,
+    sent_report: Option<String>,
+    received_report: Option<String>,
+    remote_grid: Option<String>,
+    exit_reason: Option<String>,
+    observed_station_calls: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdifRecord {
+    session_id: u64,
+    call: String,
+    qso_date: String,
+    time_on: String,
+    qso_date_off: Option<String>,
+    time_off: Option<String>,
+    band: String,
+    freq: Option<String>,
+    mode: String,
+    submode: Option<String>,
+    rst_sent: String,
+    rst_rcvd: String,
+    station_callsign: String,
+    my_gridsquare: String,
+    gridsquare: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AdifExportReport {
+    eligible_records: Vec<AdifRecord>,
+    ineligible_sessions: Vec<IneligibleQso>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IneligibleQso {
+    session_id: u64,
+    call: String,
+    started_at: Option<SystemTime>,
+    ended_at: Option<SystemTime>,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CtyLookup {
+    country: String,
+    dxcc_adif: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -4058,11 +4136,54 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
 fn main() -> Result<(), AppError> {
     let cli = Cli::parse();
+    if let Some(command) = cli.command {
+        return match command {
+            CliCommand::ExportAdif(args) => run_export_adif(args),
+        };
+    }
     if cli.oneshot {
         run_oneshot(cli)
     } else {
         run_continuous(cli)
     }
+}
+
+fn run_export_adif(args: ExportAdifArgs) -> Result<(), AppError> {
+    let config = AppConfig::load(&args.config)?;
+    let input_path = args
+        .input
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(&config.logging.fsm_log_path));
+    let contents = std::fs::read_to_string(&input_path)?;
+    let report = build_adif_export_report(
+        &contents,
+        &config.station.our_call,
+        &config.station.our_grid,
+    );
+    print_adif_export_status(&report);
+    let rendered = render_adif(&report.eligible_records);
+    if let Some(output_path) = args.output {
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(&output_path, rendered)?;
+        eprintln!(
+            "exported {} award-valid QSOs from {} to {}",
+            report.eligible_records.len(),
+            input_path.display(),
+            output_path.display()
+        );
+    } else {
+        print!("{rendered}");
+        eprintln!(
+            "exported {} award-valid QSOs from {}",
+            report.eligible_records.len(),
+            input_path.display()
+        );
+    }
+    Ok(())
 }
 
 fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
@@ -5123,6 +5244,645 @@ fn push_unique_info(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
     }
+}
+
+fn build_adif_export_report(
+    contents: &str,
+    station_callsign: &str,
+    my_gridsquare: &str,
+) -> AdifExportReport {
+    let mut sessions = BTreeMap::<QsoHistoryKey, AdifSessionSummary>::new();
+    let mut active_keys = BTreeMap::<u64, QsoHistoryKey>::new();
+    let mut next_ordinal = 1_u64;
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(fields) = value.get("fields").and_then(|fields| fields.as_object()) else {
+            continue;
+        };
+        if fields.get("message").and_then(|value| value.as_str()) != Some("qso_fsm") {
+            continue;
+        }
+        let Some(session_id) = fields.get("session_id").and_then(|value| value.as_u64()) else {
+            continue;
+        };
+        let Some(partner_call) = fields.get("partner_call").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if partner_call.eq_ignore_ascii_case("CQ") {
+            continue;
+        }
+        let Some(timestamp_str) = value.get("timestamp").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp_str) else {
+            continue;
+        };
+        let timestamp: SystemTime = parsed.with_timezone(&Utc).into();
+        let event = fields
+            .get("event")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let state_before = fields
+            .get("state_before")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let state_after = fields
+            .get("state_after")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let last_rx_event = fields
+            .get("last_rx_event")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let rx_text = fields
+            .get("rx_text")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let tx_text = fields
+            .get("tx_text")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let compound_next_call = fields
+            .get("compound_next_call")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let rig_band = fields
+            .get("rig_band")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let rig_frequency_hz = fields
+            .get("rig_frequency_hz")
+            .and_then(|value| value.as_u64())
+            .filter(|value| *value > 0);
+        let app_mode = fields
+            .get("app_mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let key = if event == "start" {
+            let key = QsoHistoryKey {
+                session_id,
+                ordinal: next_ordinal,
+            };
+            next_ordinal += 1;
+            active_keys.insert(session_id, key);
+            key
+        } else if let Some(existing) = active_keys.get(&session_id).copied() {
+            existing
+        } else {
+            let key = QsoHistoryKey {
+                session_id,
+                ordinal: next_ordinal,
+            };
+            next_ordinal += 1;
+            active_keys.insert(session_id, key);
+            key
+        };
+        let session = sessions.entry(key).or_insert_with(|| AdifSessionSummary {
+            session_id,
+            partner_call: partner_call.to_string(),
+            ..AdifSessionSummary::default()
+        });
+        if session.partner_call.is_empty() {
+            session.partner_call = partner_call.to_string();
+        }
+        session.last_seen_at = Some(timestamp);
+        if event == "start" && session.started_at.is_none() {
+            session.started_at = Some(timestamp);
+        }
+        if event == "exit" {
+            session.ended_at = Some(timestamp);
+            session.exit_reason = Some(last_rx_event.to_string());
+            active_keys.remove(&session_id);
+        }
+        if !rig_band.is_empty() && session.rig_band.is_none() {
+            session.rig_band = Some(rig_band.to_string());
+        }
+        if session.rig_frequency_hz.is_none() {
+            session.rig_frequency_hz = rig_frequency_hz;
+        }
+        if !app_mode.is_empty() && session.app_mode.is_none() {
+            session.app_mode = Some(app_mode.to_uppercase());
+        }
+        if let Some(observed) = extract_station_call_from_tx_text(tx_text) {
+            session.observed_station_calls.insert(observed);
+        }
+        if let Some(observed) = extract_station_call_from_rx_text(rx_text) {
+            session.observed_station_calls.insert(observed);
+        }
+        if last_rx_event.starts_with("to_us_") {
+            session.got_reply = true;
+        }
+        if matches!(
+            last_rx_event,
+            "to_us_ack" | "to_us_reply_rrr" | "to_us_reply_rr73" | "to_us_reply_73"
+        ) {
+            session.got_roger = true;
+        }
+        if matches!(state_before, "send_rr73" | "send_73" | "send_73_once")
+            || matches!(state_after, "send_rr73" | "send_73" | "send_73_once")
+        {
+            session.reached_73 = true;
+        }
+        if let Some(exchange) = classify_exchange_info(rx_text) {
+            match exchange {
+                ExchangeInfo::Grid(grid) => {
+                    if session.remote_grid.is_none() {
+                        session.remote_grid = Some(grid);
+                    }
+                }
+                ExchangeInfo::Report(report) => {
+                    if session.received_report.is_none() {
+                        session.received_report = Some(report);
+                    }
+                }
+            }
+        }
+        if let Some(tx_info) =
+            extract_tx_exchange_info(tx_text, event, partner_call, compound_next_call)
+        {
+            if let Some(exchange) = classify_exchange_token(&tx_info) {
+                match exchange {
+                    ExchangeInfo::Grid(_) => {}
+                    ExchangeInfo::Report(report) => {
+                        if session.sent_report.is_none() {
+                            session.sent_report = Some(report);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut eligible_records = Vec::new();
+    let mut ineligible_sessions = Vec::new();
+    for session in sessions.into_values() {
+        match adif_record_from_session(session, station_callsign, my_gridsquare) {
+            Ok(record) => eligible_records.push(record),
+            Err(ineligible) => ineligible_sessions.push(ineligible),
+        }
+    }
+    eligible_records.sort_by(|left, right| {
+        left.qso_date
+            .cmp(&right.qso_date)
+            .then(left.time_on.cmp(&right.time_on))
+            .then(left.call.cmp(&right.call))
+    });
+    ineligible_sessions.sort_by(|left, right| {
+        left.started_at
+            .unwrap_or(UNIX_EPOCH)
+            .cmp(&right.started_at.unwrap_or(UNIX_EPOCH))
+            .then(left.call.cmp(&right.call))
+    });
+    AdifExportReport {
+        eligible_records,
+        ineligible_sessions,
+    }
+}
+
+#[cfg(test)]
+fn collect_adif_records(
+    contents: &str,
+    station_callsign: &str,
+    my_gridsquare: &str,
+) -> Vec<AdifRecord> {
+    build_adif_export_report(contents, station_callsign, my_gridsquare).eligible_records
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExchangeInfo {
+    Grid(String),
+    Report(String),
+}
+
+fn classify_exchange_info(text: &str) -> Option<ExchangeInfo> {
+    let mut parts = text.split_whitespace();
+    let _first = parts.next()?;
+    let _second = parts.next()?;
+    let token = parts.next()?;
+    classify_exchange_token(token)
+}
+
+fn classify_exchange_token(token: &str) -> Option<ExchangeInfo> {
+    let token = token.trim().to_uppercase();
+    if token.is_empty() || matches!(token.as_str(), "73" | "RR73" | "RRR") {
+        return None;
+    }
+    if let Some(report) = normalize_signal_report(&token) {
+        return Some(ExchangeInfo::Report(report));
+    }
+    if is_gridsquare(&token) {
+        return Some(ExchangeInfo::Grid(token));
+    }
+    None
+}
+
+fn normalize_signal_report(token: &str) -> Option<String> {
+    let raw = token.strip_prefix('R').unwrap_or(token);
+    let bytes = raw.as_bytes();
+    if bytes.len() != 3 {
+        return None;
+    }
+    if bytes[0] != b'+' && bytes[0] != b'-' {
+        return None;
+    }
+    if !bytes[1].is_ascii_digit() || !bytes[2].is_ascii_digit() {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn extract_station_call_from_tx_text(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    if let Some((_, rest)) = text.split_once(" RR73; ") {
+        let mut parts = rest.split_whitespace();
+        let _partner = parts.next()?;
+        return normalize_call_token(parts.next()?);
+    }
+    let mut parts = text.split_whitespace();
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if first.eq_ignore_ascii_case("CQ") {
+        return normalize_call_token(second);
+    }
+    normalize_call_token(second)
+}
+
+fn extract_station_call_from_rx_text(text: &str) -> Option<String> {
+    let mut parts = text.split_whitespace();
+    let first = parts.next()?;
+    if first.eq_ignore_ascii_case("CQ") {
+        return None;
+    }
+    normalize_call_token(first)
+}
+
+fn normalize_call_token(token: &str) -> Option<String> {
+    let normalized = token
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized.to_uppercase())
+}
+
+fn is_gridsquare(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if !(bytes.len() == 4 || bytes.len() == 6) {
+        return false;
+    }
+    bytes[0].is_ascii_uppercase()
+        && bytes[1].is_ascii_uppercase()
+        && bytes[0] <= b'R'
+        && bytes[1] <= b'R'
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && (bytes.len() == 4
+            || (bytes[4].is_ascii_uppercase()
+                && bytes[5].is_ascii_uppercase()
+                && bytes[4] <= b'X'
+                && bytes[5] <= b'X'))
+}
+
+fn adif_record_from_session(
+    session: AdifSessionSummary,
+    station_callsign: &str,
+    my_gridsquare: &str,
+) -> Result<AdifRecord, IneligibleQso> {
+    let started_at = session.started_at.or(session.last_seen_at);
+    let ended_at = session.ended_at.or(session.last_seen_at);
+    let mut reasons = Vec::new();
+    if !session.got_reply {
+        reasons.push("no directed reply from peer".to_string());
+    }
+    if !session.got_roger {
+        reasons.push("no roger/ack from peer".to_string());
+    }
+    if !session.reached_73 {
+        reasons.push("we never sent terminal 73/RR73".to_string());
+    }
+    let configured_station = station_callsign.trim().to_uppercase();
+    let mismatched_station_calls = session
+        .observed_station_calls
+        .iter()
+        .filter(|call| *call != &configured_station)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !session.observed_station_calls.is_empty()
+        && !session.observed_station_calls.contains(&configured_station)
+    {
+        reasons.push(format!(
+            "session logged under different station callsign(s): {}",
+            mismatched_station_calls.join(", ")
+        ));
+    }
+    let band = match session.rig_band.as_deref().and_then(normalize_adif_band) {
+        Some(value) => Some(value),
+        None => {
+            reasons.push("missing rig band".to_string());
+            None
+        }
+    };
+    let mode_parts = match session.app_mode.as_deref().and_then(normalize_adif_mode) {
+        Some(value) => Some(value),
+        None => {
+            reasons.push("missing or unsupported app mode".to_string());
+            None
+        }
+    };
+    let rst_sent = match session.sent_report.clone() {
+        Some(value) => Some(value),
+        None => {
+            reasons.push("missing sent report".to_string());
+            None
+        }
+    };
+    let rst_rcvd = match session.received_report.clone() {
+        Some(value) => Some(value),
+        None => {
+            reasons.push("missing received report".to_string());
+            None
+        }
+    };
+    if started_at.is_none() {
+        reasons.push("missing QSO start time".to_string());
+    }
+    if !reasons.is_empty() {
+        return Err(IneligibleQso {
+            session_id: session.session_id,
+            call: session.partner_call,
+            started_at,
+            ended_at,
+            reasons,
+        });
+    }
+    let (mode, submode) = mode_parts.expect("validated mode");
+    Ok(AdifRecord {
+        session_id: session.session_id,
+        call: session.partner_call,
+        qso_date: format_adif_date(started_at.expect("validated start")),
+        time_on: format_adif_time(started_at.expect("validated start")),
+        qso_date_off: ended_at.map(format_adif_date),
+        time_off: ended_at.map(format_adif_time),
+        band: band.expect("validated band"),
+        freq: session.rig_frequency_hz.map(format_adif_freq_mhz),
+        mode: mode.to_string(),
+        submode: submode.map(str::to_string),
+        rst_sent: rst_sent.expect("validated sent report"),
+        rst_rcvd: rst_rcvd.expect("validated received report"),
+        station_callsign: station_callsign.to_string(),
+        my_gridsquare: my_gridsquare.to_string(),
+        gridsquare: session.remote_grid,
+    })
+}
+
+fn normalize_adif_band(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_uppercase())
+}
+
+fn normalize_adif_mode(value: &str) -> Option<(&'static str, Option<&'static str>)> {
+    match value.trim().to_uppercase().as_str() {
+        "FT8" => Some(("MFSK", Some("FT8"))),
+        "FT4" => Some(("MFSK", Some("FT4"))),
+        _ => None,
+    }
+}
+
+fn format_adif_date(time: SystemTime) -> String {
+    let timestamp: DateTime<Utc> = time.into();
+    timestamp.format("%Y%m%d").to_string()
+}
+
+fn format_adif_time(time: SystemTime) -> String {
+    let timestamp: DateTime<Utc> = time.into();
+    timestamp.format("%H%M%S").to_string()
+}
+
+fn format_adif_freq_mhz(frequency_hz: u64) -> String {
+    format!("{:.6}", frequency_hz as f64 / 1_000_000.0)
+}
+
+fn print_adif_export_status(report: &AdifExportReport) {
+    eprintln!(
+        "ADIF export status: {} eligible, {} ineligible",
+        report.eligible_records.len(),
+        report.ineligible_sessions.len()
+    );
+    if !report.ineligible_sessions.is_empty() {
+        let mut by_reason = BTreeMap::<String, usize>::new();
+        for session in &report.ineligible_sessions {
+            for reason in &session.reasons {
+                *by_reason.entry(reason.clone()).or_default() += 1;
+            }
+        }
+        eprintln!("Ineligible summary:");
+        for (reason, count) in by_reason {
+            eprintln!("  {count:>3}  {reason}");
+        }
+        eprintln!("Ineligible QSOs:");
+        for session in &report.ineligible_sessions {
+            let when = session
+                .started_at
+                .or(session.ended_at)
+                .map(format_datetime)
+                .unwrap_or_else(|| "-".to_string());
+            eprintln!(
+                "  {}  #{}  {}  {}",
+                when,
+                session.session_id,
+                session.call,
+                session.reasons.join("; ")
+            );
+        }
+    }
+
+    let unique_grids = report
+        .eligible_records
+        .iter()
+        .filter_map(|record| record.gridsquare.clone())
+        .collect::<BTreeSet<_>>();
+    let calls = report
+        .eligible_records
+        .iter()
+        .map(|record| record.call.clone())
+        .collect::<Vec<_>>();
+    match lookup_cty_for_calls(&calls) {
+        Ok(lookups) => {
+            let unique_countries = lookups
+                .values()
+                .map(|entry| entry.country.clone())
+                .collect::<BTreeSet<_>>();
+            let unique_dxcc = lookups
+                .values()
+                .map(|entry| entry.dxcc_adif)
+                .collect::<BTreeSet<_>>();
+            eprintln!(
+                "Eligible summary: {} unique grids, {} unique countries, {} unique DXCC entities",
+                unique_grids.len(),
+                unique_countries.len(),
+                unique_dxcc.len()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "Eligible summary: {} unique grids; country/DXCC summary unavailable ({error})",
+                unique_grids.len()
+            );
+        }
+    }
+}
+
+fn lookup_cty_for_calls(calls: &[String]) -> Result<BTreeMap<String, CtyLookup>, String> {
+    if calls.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut child = Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"
+import dbm.gnu, json, marshal, os, sys
+
+def variants(call):
+    call = call.strip().upper()
+    values = []
+    if call:
+        values.append(call)
+        for part in call.split('/'):
+            part = part.strip()
+            if part and part not in values:
+                values.append(part)
+    return values
+
+def resolve(db, call):
+    best = None
+    for candidate in variants(call):
+        for width in range(len(candidate), 0, -1):
+            key = candidate[:width].encode()
+            if key not in db:
+                continue
+            value = marshal.loads(db[key])
+            if value.get('ExactCallsign') and width != len(candidate):
+                continue
+            best = value
+            break
+        if best is not None:
+            break
+    if best is None:
+        return None
+    adif = best.get('ADIF')
+    country = best.get('Country')
+    if adif is None or not country:
+        return None
+    return {'country': country, 'dxcc_adif': int(adif)}
+
+path = os.path.expanduser(os.environ.get('CTY_DB_PATH', '~/.local/cty'))
+calls = json.load(sys.stdin)
+db = dbm.gnu.open(path, 'r')
+result = {}
+for call in calls:
+    resolved = resolve(db, call)
+    if resolved is not None:
+        result[call] = resolved
+print(json.dumps(result))
+"#,
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start python3 lookup helper: {error}"))?;
+    let input =
+        serde_json::to_vec(calls).map_err(|error| format!("json encode failed: {error}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "python3 lookup helper stdin unavailable".to_string())?
+        .write_all(&input)
+        .map_err(|error| format!("failed to write calls to lookup helper: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("python3 lookup helper failed: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("python3 lookup helper exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    let raw = serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(&output.stdout)
+        .map_err(|error| format!("lookup helper returned invalid json: {error}"))?;
+    let mut resolved = BTreeMap::new();
+    for (call, value) in raw {
+        let Some(country) = value.get("country").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(dxcc_adif) = value
+            .get("dxcc_adif")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            continue;
+        };
+        resolved.insert(
+            call,
+            CtyLookup {
+                country: country.to_string(),
+                dxcc_adif,
+            },
+        );
+    }
+    Ok(resolved)
+}
+
+fn render_adif(records: &[AdifRecord]) -> String {
+    let mut output = String::new();
+    append_adif_field(&mut output, "ADIF_VER", "3.1.4");
+    append_adif_field(&mut output, "PROGRAMID", "ft8rx");
+    append_adif_field(&mut output, "PROGRAMVERSION", env!("CARGO_PKG_VERSION"));
+    output.push_str("<EOH>\n");
+    for record in records {
+        append_adif_field(&mut output, "CALL", &record.call);
+        append_adif_field(&mut output, "QSO_DATE", &record.qso_date);
+        append_adif_field(&mut output, "TIME_ON", &record.time_on);
+        if let Some(value) = record.qso_date_off.as_deref() {
+            append_adif_field(&mut output, "QSO_DATE_OFF", value);
+        }
+        if let Some(value) = record.time_off.as_deref() {
+            append_adif_field(&mut output, "TIME_OFF", value);
+        }
+        append_adif_field(&mut output, "BAND", &record.band);
+        if let Some(value) = record.freq.as_deref() {
+            append_adif_field(&mut output, "FREQ", value);
+        }
+        append_adif_field(&mut output, "MODE", &record.mode);
+        if let Some(value) = record.submode.as_deref() {
+            append_adif_field(&mut output, "SUBMODE", value);
+        }
+        append_adif_field(&mut output, "RST_SENT", &record.rst_sent);
+        append_adif_field(&mut output, "RST_RCVD", &record.rst_rcvd);
+        append_adif_field(&mut output, "STATION_CALLSIGN", &record.station_callsign);
+        append_adif_field(&mut output, "MY_GRIDSQUARE", &record.my_gridsquare);
+        if let Some(value) = record.gridsquare.as_deref() {
+            append_adif_field(&mut output, "GRIDSQUARE", value);
+        }
+        output.push_str("<EOR>\n");
+    }
+    output
+}
+
+fn append_adif_field(output: &mut String, name: &str, value: &str) {
+    let _ = write!(output, "<{}:{}>{}", name, value.len(), value);
 }
 
 fn resolve_app_rig_kind(config: &AppConfig) -> Result<RigKind, AppError> {
@@ -10450,5 +11210,126 @@ mod tests {
         let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
         assert_eq!(scan.history.len(), 1);
         assert_eq!(scan.history[0].mode, "FT4");
+    }
+
+    #[test]
+    fn collect_adif_records_exports_only_award_valid_qsos() {
+        let contents = r#"{"timestamp":"2026-04-04T05:00:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":20,"partner_call":"K1ABC","state_before":"idle","state_after":"send_grid","last_rx_event":"start_context","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"CQ K1ABC FN20","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":20,"partner_call":"K1ABC","state_before":"send_grid","state_after":"send_sig_ack","last_rx_event":"to_us_report_like","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"N1VF K1ABC -08","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":20,"partner_call":"K1ABC","state_before":"send_sig_ack","state_after":"send_rr73","last_rx_event":"to_us_ack","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"N1VF K1ABC R-08","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:45Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":20,"partner_call":"K1ABC","state_before":"send_sig_ack","state_after":"send_sig_ack","last_rx_event":"to_us_report_like","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":"K1ABC N1VF R-07"}}
+{"timestamp":"2026-04-04T05:01:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":20,"partner_call":"K1ABC","state_before":"send_rr73","state_after":"send_rr73","last_rx_event":"to_us_ack","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":"K1ABC N1VF RR73"}}
+{"timestamp":"2026-04-04T05:01:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":20,"partner_call":"K1ABC","state_before":"send_rr73","state_after":"idle","last_rx_event":"send_rr73_no_msg_limit","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":""}}
+{"timestamp":"2026-04-04T05:02:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":21,"partner_call":"W1XYZ","state_before":"idle","state_after":"send_grid","last_rx_event":"start_context","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"CQ W1XYZ FN31","tx_text":""}}
+{"timestamp":"2026-04-04T05:02:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":21,"partner_call":"W1XYZ","state_before":"send_grid","state_after":"send_sig_ack","last_rx_event":"to_us_report_like","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"N1VF W1XYZ -05","tx_text":""}}
+{"timestamp":"2026-04-04T05:02:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":21,"partner_call":"W1XYZ","state_before":"send_sig_ack","state_after":"idle","last_rx_event":"stopped","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":""}}"#;
+        let records = collect_adif_records(contents, "N1VF", "CM97");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].call, "K1ABC");
+        assert_eq!(records[0].band, "20M");
+        assert_eq!(records[0].freq.as_deref(), Some("14.074000"));
+        assert_eq!(records[0].mode, "MFSK");
+        assert_eq!(records[0].submode.as_deref(), Some("FT8"));
+        assert_eq!(records[0].rst_sent, "-07");
+        assert_eq!(records[0].rst_rcvd, "-08");
+        assert_eq!(records[0].gridsquare.as_deref(), Some("FN20"));
+    }
+
+    #[test]
+    fn collect_adif_records_requires_both_signal_reports() {
+        let contents = r#"{"timestamp":"2026-04-04T05:00:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":22,"partner_call":"K1ABC","state_before":"idle","state_after":"send_grid","last_rx_event":"start_context","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"CQ K1ABC FN20","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":22,"partner_call":"K1ABC","state_before":"send_grid","state_after":"send_sig_ack","last_rx_event":"to_us_ack","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"N1VF K1ABC R-08","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":22,"partner_call":"K1ABC","state_before":"send_rr73","state_after":"send_rr73","last_rx_event":"to_us_ack","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":"K1ABC N1VF RR73"}}
+{"timestamp":"2026-04-04T05:00:45Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":22,"partner_call":"K1ABC","state_before":"send_rr73","state_after":"idle","last_rx_event":"send_rr73_no_msg_limit","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":""}}"#;
+        let records = collect_adif_records(contents, "N1VF", "CM97");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn build_adif_export_report_lists_ineligible_reasons() {
+        let contents = r#"{"timestamp":"2026-04-04T05:00:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":23,"partner_call":"W1XYZ","state_before":"idle","state_after":"send_grid","last_rx_event":"start_context","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"CQ W1XYZ FN31","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":23,"partner_call":"W1XYZ","state_before":"send_grid","state_after":"send_sig_ack","last_rx_event":"to_us_report_like","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"N1VF W1XYZ -05","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":23,"partner_call":"W1XYZ","state_before":"send_sig_ack","state_after":"idle","last_rx_event":"stopped","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":""}}"#;
+        let report = build_adif_export_report(contents, "N1VF", "CM97");
+        assert!(report.eligible_records.is_empty());
+        assert_eq!(report.ineligible_sessions.len(), 1);
+        assert_eq!(report.ineligible_sessions[0].session_id, 23);
+        assert!(
+            report.ineligible_sessions[0]
+                .reasons
+                .contains(&"no roger/ack from peer".to_string())
+        );
+        assert!(
+            report.ineligible_sessions[0]
+                .reasons
+                .contains(&"we never sent terminal 73/RR73".to_string())
+        );
+        assert!(
+            report.ineligible_sessions[0]
+                .reasons
+                .contains(&"missing sent report".to_string())
+        );
+    }
+
+    #[test]
+    fn exporter_allows_remote_station_named_like_previous_home_call() {
+        let contents = r#"{"timestamp":"2026-04-04T05:00:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":24,"partner_call":"N1VF","state_before":"idle","state_after":"send_grid","last_rx_event":"start_context","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"CQ N1VF CM97","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":24,"partner_call":"N1VF","state_before":"send_grid","state_after":"send_sig_ack","last_rx_event":"to_us_report_like","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"E51RWK N1VF -08","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":24,"partner_call":"N1VF","state_before":"send_sig_ack","state_after":"send_rr73","last_rx_event":"to_us_ack","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"E51RWK N1VF R-08","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:45Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":24,"partner_call":"N1VF","state_before":"send_sig_ack","state_after":"send_sig_ack","last_rx_event":"to_us_report_like","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":"N1VF E51RWK R-07"}}
+{"timestamp":"2026-04-04T05:01:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":24,"partner_call":"N1VF","state_before":"send_rr73","state_after":"send_rr73","last_rx_event":"to_us_ack","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":"N1VF E51RWK RR73"}}
+{"timestamp":"2026-04-04T05:01:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":24,"partner_call":"N1VF","state_before":"send_rr73","state_after":"idle","last_rx_event":"send_rr73_no_msg_limit","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":""}}"#;
+        let records = collect_adif_records(contents, "E51RWK", "BG08");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].call, "N1VF");
+        assert_eq!(records[0].station_callsign, "E51RWK");
+    }
+
+    #[test]
+    fn exporter_rejects_sessions_logged_under_different_station_call() {
+        let contents = r#"{"timestamp":"2026-04-04T05:00:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":25,"partner_call":"K1ABC","state_before":"idle","state_after":"send_grid","last_rx_event":"start_context","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"CQ K1ABC FN20","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":25,"partner_call":"K1ABC","state_before":"send_grid","state_after":"send_sig_ack","last_rx_event":"to_us_report_like","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"N1VF K1ABC -08","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":25,"partner_call":"K1ABC","state_before":"send_sig_ack","state_after":"send_rr73","last_rx_event":"to_us_ack","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"N1VF K1ABC R-08","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:45Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":25,"partner_call":"K1ABC","state_before":"send_sig_ack","state_after":"send_sig_ack","last_rx_event":"to_us_report_like","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":"K1ABC N1VF R-07"}}
+{"timestamp":"2026-04-04T05:01:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":25,"partner_call":"K1ABC","state_before":"send_rr73","state_after":"send_rr73","last_rx_event":"to_us_ack","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":"K1ABC N1VF RR73"}}
+{"timestamp":"2026-04-04T05:01:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":25,"partner_call":"K1ABC","state_before":"send_rr73","state_after":"idle","last_rx_event":"send_rr73_no_msg_limit","rig_band":"20m","rig_frequency_hz":14074000,"app_mode":"ft8","rx_text":"","tx_text":""}}"#;
+        let report = build_adif_export_report(contents, "E51RWK", "BG08");
+        assert!(report.eligible_records.is_empty());
+        assert_eq!(report.ineligible_sessions.len(), 1);
+        assert!(
+            report.ineligible_sessions[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("different station callsign(s): N1VF"))
+        );
+    }
+
+    #[test]
+    fn render_adif_writes_expected_fields() {
+        let record = AdifRecord {
+            session_id: 1,
+            call: "K1ABC".to_string(),
+            qso_date: "20260404".to_string(),
+            time_on: "050000".to_string(),
+            qso_date_off: Some("20260404".to_string()),
+            time_off: Some("050115".to_string()),
+            band: "20M".to_string(),
+            freq: Some("14.074000".to_string()),
+            mode: "MFSK".to_string(),
+            submode: Some("FT8".to_string()),
+            rst_sent: "-07".to_string(),
+            rst_rcvd: "-08".to_string(),
+            station_callsign: "N1VF".to_string(),
+            my_gridsquare: "CM97".to_string(),
+            gridsquare: Some("FN20".to_string()),
+        };
+        let adif = render_adif(&[record]);
+        assert!(adif.contains("<ADIF_VER:5>3.1.4<PROGRAMID:5>ft8rx"));
+        assert!(adif.contains("<CALL:5>K1ABC"));
+        assert!(adif.contains("<MODE:4>MFSK<SUBMODE:3>FT8"));
+        assert!(adif.contains("<RST_SENT:3>-07<RST_RCVD:3>-08"));
+        assert!(
+            adif.contains("<STATION_CALLSIGN:4>N1VF<MY_GRIDSQUARE:4>CM97<GRIDSQUARE:4>FN20<EOR>")
+        );
     }
 }
